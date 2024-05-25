@@ -62,7 +62,6 @@ void AACRTPSession::ThreadFunction()
         this->PushStream( tTimestampStep, &dtFrm );
 
         //
-        //this_thread::sleep_for( chrono::milliseconds( tSleepPeriod ) );
-        usleep( 23000 );
+        this_thread::sleep_for( chrono::milliseconds( tSleepPeriod ) );
     }
 }
