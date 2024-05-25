@@ -1,10 +1,9 @@
 #include "aac.h"
 
 int AAC::gm_arrSampFrqIdxValue[ 16 ] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, -1, -1, 0 };
-int idx = 0;
+
 AAC::AAC()
 {
-    idx = 0;
 }
 
 AAC::~AAC()
@@ -60,12 +59,8 @@ AAC::FrameInfoEx AAC::GetFrame( bool bNext )
     // Get AAC data size
     dtFrm.m_lAACDataSize = dtFrm.m_lFrmSize - dtFrm.get_adts_header_size();
 
-    printf("%d: 0x%08x FrmSize:%d\n\n", idx, ( pSyncword - this->m_pStart ), dtFrm.m_lFrmSize);
-
     // Seek to next frame
     if( bNext ) this->Seek( dtFrm.m_lFrmSize, CFileMap::SeekPosition::current );
-    
-    idx++;
 
     return dtFrm;
 }
