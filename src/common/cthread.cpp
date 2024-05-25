@@ -25,7 +25,7 @@ void* CThread::ThreadProcess()
     return nullptr;
 }
 
-bool CThread::Init( thread&& t, const int iEventCnt )
+bool CThread::InitThread( thread&& t, const int iEventCnt )
 {
     if( m_mtx.Lock() )
     {
@@ -34,8 +34,8 @@ bool CThread::Init( thread&& t, const int iEventCnt )
         // Release Thread
         if( this->is_running() && m_bCreate )
         {
-            pthread_cancel( m_hThread );
-            pthread_exit( &m_hThread );
+            //pthread_cancel( m_hThread );
+            //pthread_exit( &m_hThread );
             this->set_running( false );
 
             m_thread.join();
@@ -59,9 +59,9 @@ bool CThread::Init( thread&& t, const int iEventCnt )
     return false;
 }
 
-bool CThread::Init( LPTHREADFUNCTION lpFunction, void* lpUserData, const int iEventCnt )
+bool CThread::InitThread( LPTHREADFUNCTION lpFunction, void* lpUserData, const int iEventCnt )
 {
-    return this->Init( move( thread( lpFunction, lpUserData ) ), iEventCnt );
+    return this->InitThread( move( thread( lpFunction, lpUserData ) ), iEventCnt );
 }
 
 void CThread::ReleaseThread()

@@ -30,12 +30,9 @@ public:
     CThread( thread&& t );
     ~CThread();
 
-    virtual void*   ThreadProcess();
-    virtual void    ThreadFunction() {}
-    virtual bool    Init( thread&& t, const int iEventCnt );
-    virtual bool    Init( LPTHREADFUNCTION lpFunction, void* lpUserData, const int iEventCnt );
+    virtual bool    InitThread( thread&& t, const int iEventCnt );
+    virtual bool    InitThread( LPTHREADFUNCTION lpFunction, void* lpUserData, const int iEventCnt );
 
-    void ReleaseThread();
     bool SetExit( const int iWaittingQuitMSec, const bool bRelease );
 
     // Inline
@@ -55,9 +52,15 @@ public:
 
     inline void InitialThread( LPTHREADFUNCTION lpFunction, void* lpUserData, const int iEventCnt )
     {
-        this->InitialThread( lpFunction, lpUserData, iEventCnt );
+        this->InitThread( lpFunction, lpUserData, iEventCnt );
     }
 
+protected:
+    virtual void*   ThreadProcess();
+    virtual void    ThreadFunction() {}
+
 private:
+    void ReleaseThread();
+    
     static void* InitialThreadProc( void* lpUserData ) { return ( lpUserData ? reinterpret_cast< CThread* >( lpUserData )->ThreadProcess() : NULL ); }
 };

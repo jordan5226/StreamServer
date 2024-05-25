@@ -52,6 +52,8 @@ public:
         //
         return ( ( m_tvEnd.tv_sec - m_tvStart.tv_sec ) * 1000 ) + ( ( m_tvEnd.tv_usec - m_tvStart.tv_usec ) / 1000 );
     }
+
+    inline bool is_started() { return ( m_tvStart.tv_sec > 0 || m_tvStart.tv_usec > 0 ); }
 };
 
 typedef const Counter  C_COUNTER;
