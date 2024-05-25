@@ -74,7 +74,7 @@ int CSocket::InitService( PROTO eProtocal, int iPort, int iConnNum )
     }
 
     if( PROTO_UDP == eProtocal )
-        printf( "Init UDP server on port: %d\n", iPort );
+        printf( "Init UDP channel on port: %d\n", iPort );
     else if( PROTO_TCP == eProtocal )
         printf( "Init TCP server on port: %d\n", iPort );
 

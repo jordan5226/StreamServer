@@ -3,16 +3,46 @@
 #include <unistd.h>
 #include <string.h>
 #include <algorithm>
+#include <sys/time.h>
 #include "../common/util.h"
+#include "../common/counter.h"
+#include "../codec/h264.h"
+#include "../codec/aac.h"
 
 using namespace std;
 
+/*************************************************
+ * RTSPInfo
+ *************************************************/
+/// @brief Get file name from the URL of RTSP info
+/// @param lpszFileName File name buffer
+inline void RTSP::RTSPInfo::get_file_name( char* lpszFileName )
+{
+    sscanf( this->m_szUrl, "%*[^:]:%*2[/]%*[^/]/%[^/]", lpszFileName );
+}
+
+inline int RTSP::RTSPInfo::get_track_idx()
+{
+    int iTrackIdx = -1;
+    sscanf( this->m_szUrl, "%*[^:]:%*2[/]%*[^/]/%*[^/]/track%d", &iTrackIdx );
+    return iTrackIdx;
+}
+
+/*************************************************
+ * ClientInfo
+ *************************************************/
 void RTSP::ClientInfo::ReleaseThread()
 {
-    if( this->m_pThread.get() )
+    if( this->m_pVidThread.get() )
     {
-        this->m_pThread->SetExit( 500, true );
-        this->m_pThread.reset();
+        this->m_pVidThread->SetExit( 500, true );
+        this->m_pVidThread.reset();
+    }
+
+    if( this->m_pAudThread.get() )
+    {
+        this->m_pAudThread->SetExit( 500, true );
+        this->m_pAudThread.reset();
     }
 }
 
@@ -22,8 +52,13 @@ void RTSP::ClientInfo::Disconnect()
     this->Close();
 }
 
-RTSP::RTSP( const char* lpszFile ) : CSocket()
-    , m_strFile( lpszFile )
+/*************************************************
+ * RTSP
+ *************************************************/
+/// @brief RTSP handler
+/// @param lpszFilePath Media data file path
+RTSP::RTSP( const char* lpszFilePath ) : CSocket()
+    , m_strFilePath( lpszFilePath )
 {
     srand( time( NULL) );
 }
@@ -32,19 +67,20 @@ RTSP::~RTSP()
 {
     this->set_running( false );
 
-    if( this->m_mtx.Lock() )
+    if( this->Lock() )
     {
         //
-        for( auto client : this->m_vClient )
+        for( auto pClient : this->m_vClient )
         {
-            client.Disconnect();
+            pClient->Disconnect();
+            delete pClient;
         }
 
         //
         this->m_vClient.clear();
         this->m_vSSRC.clear();
 
-        this->m_mtx.Unlock();
+        this->Unlock();
     }
 }
 
@@ -78,18 +114,21 @@ int RTSP::StartService()
         if( this->m_arrRTSPFD[ 1 ] > nfds ) nfds = this->m_arrRTSPFD[ 1 ];
 
         // Add child sockets to read fd set
-        if( m_mtx.Lock() )
+        if( this->Lock() )
         {
-            for( auto client : m_vClient )
+            for( auto pClient : m_vClient )
             {
-                if( client.m_fdSock > 0 )
-                    FD_SET( client.m_fdSock, &rfds );
+                if( !pClient )
+                    continue;
 
-                if( client.m_fdSock > nfds )
-                    nfds = client.m_fdSock;
+                if( pClient->m_fdSock > 0 )
+                    FD_SET( pClient->m_fdSock, &rfds );
+
+                if( pClient->m_fdSock > nfds )
+                    nfds = pClient->m_fdSock;
             }
 
-            m_mtx.Unlock();
+            this->Unlock();
         }
 
         // Select fd
@@ -115,37 +154,45 @@ int RTSP::StartService()
                 printf("New connection, fd: %d, IP:%s, Port:%d\n", cs, inet_ntoa( sinClient.sin_addr ), ntohs( sinClient.sin_port ) );
 
                 //
-                ClientInfo dtClient;
-                if( m_mtx.Lock() )
+                ClientInfo* pClient = new ClientInfo();
+                if( pClient )
                 {
-                    dtClient.m_eProtocal = PROTO::PROTO_TCP;
-                    dtClient.m_fdSock    = cs;
-                    dtClient.m_sin       = sinClient;
-                    m_vClient.push_back( dtClient );
-                    m_mtx.Unlock();
+                    if( this->Lock() )
+                    {
+                        pClient->m_eProtocal = PROTO::PROTO_TCP;
+                        pClient->m_fdSock    = cs;
+                        pClient->m_sin       = sinClient;
+                        m_vClient.push_back( pClient );
+                        this->Unlock();
+                    }
                 }
             }
         }
 
         // Case: Handle packet
-        if( m_mtx.Lock() )
+        if( this->Lock() )
         {
             for( int i = m_vClient.size() - 1; i >= 0; --i )
             {
-                if( FD_ISSET( m_vClient[ i ].m_fdSock, &rfds ) )
+                if( !m_vClient[ i ] )
+                    continue;
+
+                if( FD_ISSET( m_vClient[ i ]->m_fdSock, &rfds ) )
                 {
-                    if( !ProcessClient( m_vClient[ i ] ) )
+                    if( !ProcessClient( *m_vClient[ i ] ) )
                     {   // Client disconnected
-                        m_vClient[ i ].Disconnect();
+                        m_vClient[ i ]->Disconnect();
 
-                        this->RemoveSSRC( m_vClient[ i ].m_dtRTSP.m_iSSRC );
+                        for( auto ssrc : m_vClient[ i ]->m_dtRTSP.m_arrSSRC )
+                            this->RemoveSSRC( ssrc );
 
+                        delete m_vClient[ i ];
                         m_vClient.erase( m_vClient.begin() + i );
                     }
                 }
             }
 
-            m_mtx.Unlock();
+            this->Unlock();
         }
     }
 
@@ -154,47 +201,8 @@ int RTSP::StartService()
     return 0;
 }
 
-void RTSP::PlayThread( ClientInfo& dtClient, RTSP* lpThis )
-{
-    if( !lpThis )
-        return;
-
-    weak_ptr< CThread > wpThread;
-
-    //
-    for( int i = 0; ; ++i )
-    {
-        if( i == 5 )
-        {
-            cerr << "RTSP::PlayThread - Thread is not ready!" << endl;
-            return;
-        }
-
-        if( lpThis->Lock() )
-        {
-            if( dtClient.m_pThread.get() )
-            {
-                wpThread = dtClient.m_pThread;
-                lpThis->Unlock();
-                break;
-            }
-
-            lpThis->Unlock();
-        }
-
-        this_thread::sleep_for( chrono::milliseconds( 20 ) );
-    }
-
-    //
-    lpThis->Play( dtClient );
-
-    //
-    if( shared_ptr< CThread > pThread = wpThread.lock() )
-        pThread->set_running( false );
-}
-
 bool RTSP::ProcessClient( ClientInfo& dtClient )
-{
+{   // Note: Lock by caller
     // Recv Data
     int iRead = 0, iLeft = LEN_BUF, iPos = 0;
     char szBuf[ LEN_BUF ] = { 0 };
@@ -233,9 +241,18 @@ bool RTSP::ProcessClient( ClientInfo& dtClient )
 
     // Process method
     if( !strcmp( dtClient.m_dtRTSP.m_szMethod, "PLAY" ) )
-        dtClient.m_pThread = make_shared< CThread >( thread( RTSP::PlayThread, std::ref( dtClient ), this ) );
+    {
+#if SUPPORT_VIDEO
+        this->PlayVideo( dtClient );
+#endif
+#if SUPPORT_AUDIO
+        this->PlayAudio( dtClient );
+#endif
+    }
     else if( !strcmp( dtClient.m_dtRTSP.m_szMethod, "TEARDOWN" ) )
+    {
         return false;
+    }
 
     return true;
 }
@@ -247,7 +264,7 @@ bool RTSP::CreateSSRC( int& iSSRC )
         if( !this->is_running() )
             return false;
 
-        if( this->m_mtx.Lock( 5000 ) )
+        if( this->Lock( 5000 ) )
         {
             iSSRC = rand();
 
@@ -262,7 +279,7 @@ bool RTSP::CreateSSRC( int& iSSRC )
 
             this->m_vSSRC.push_back( iSSRC );
 
-            this->m_mtx.Unlock();
+            this->Unlock();
             return true;
         }
     }
@@ -272,7 +289,7 @@ bool RTSP::CreateSSRC( int& iSSRC )
 
 void RTSP::RemoveSSRC( int iSSRC )
 {
-    if( this->m_mtx.Lock() )
+    if( this->Lock() )
     {
         for( int i = 0, iSize = this->m_vSSRC.size(); i < iSize; ++i )
         {
@@ -283,7 +300,7 @@ void RTSP::RemoveSSRC( int iSSRC )
             }
         }
         
-        this->m_mtx.Unlock();
+        this->Unlock();
     }
 }
 
@@ -299,21 +316,69 @@ bool RTSP::MakeResponse( int iBufSize, char* lpszBuf, RTSPInfo& dtRTSP )
     }
     else if( !strcmp( dtRTSP.m_szMethod, "DESCRIBE" ) )
     {
-        char szIP[ 132 ]  = { 0 };
+        char szFileName[ LEN_FILENAME ] = { 0 };
+        char szIP[ 132 ] = { 0 };
         char szSDP[ 1024 ] = { 0 };
+        char szSDP_Aud[ 512 ] = { 0 };
+        string strFullFilePath = "";
 
+        // Get IP Address
         sscanf( dtRTSP.m_szUrl, "rtsp://%[^:]:", szIP );
 
+#if SUPPORT_AUDIO
+        // Generate SDP ( Audio Part )
+        dtRTSP.get_file_name( szFileName );
+        strFullFilePath  = this->GetFullFilePath( szFileName );
+        strFullFilePath += AAC_FILE_EXT;
+
+        AAC aac;
+        if( aac.OpenFile( strFullFilePath.c_str(), CFileMap::modeRead ) )
+        {
+            AAC::FrameInfoEx dtFrm;
+            dtFrm = aac.GetFrame();
+
+            char szConfig[ 12 ] = { 0 };
+            snprintf( szConfig, sizeof( szConfig ), "%02x%02x", 
+		            (uint8_t)( ( dtFrm.m_nProfile + 1 ) << 3 ) | ( dtFrm.m_nSampFrqIdx >> 1 ), 
+		            (uint8_t)( ( dtFrm.m_nSampFrqIdx << 7 ) | ( dtFrm.m_nChannels << 3 ) ) );
+
+            snprintf( szSDP_Aud, sizeof( szSDP_Aud ), 
+                "m=audio 0 RTP/AVP %d\r\n"                                      // MediaType:audio, Port:0(response in SETUP), Protocal:RTP/AVP(RTP over UDP/Audio-Video Profile), RTPPayloadType:97(AAC)
+                "a=rtpmap:%d mpeg4-generic/%d/%d\r\n"                           // RTPPayloadType:97(AAC), Codec:MPEG-4, ClockFrequency:44100Hz, Channel:2
+                "a=fmtp:%d streamtype=5; profile-level-id=1; mode=AAC-hbr;"     // Mode:High Bitrate AAC
+                "sizelength=13;indexlength=3;indexdeltalength=3;"               // AAC Frame Length(AU-size):13 bits, AU-Index:3 bits, AU-Index-delta:3 bits
+                "config=%s;\r\n"                                                // AAC config
+                "a=control:track%d\r\n",                                        // The control path of the stream is 'track1'
+                RTP_PAYLOAD_TYPE_AAC, 
+                RTP_PAYLOAD_TYPE_AAC, AAC::gm_arrSampFrqIdxValue[ dtFrm.m_nSampFrqIdx ], dtFrm.m_nChannels, 
+                RTP_PAYLOAD_TYPE_AAC, 
+                szConfig, 
+                RTSPInfo::TRACK_AUDIO );
+        }
+#endif
+
+        // Generate SDP
         snprintf( szSDP, sizeof( szSDP ), 
             "v=0\r\n"                       // Session Description Protocol Version
             "o=- 9%ld 1 IN IP4 %s\r\n"      // Username:-, SessionID:9+time(NULL), SessionVersion:1, NetworkType:IN(means Internet), AddressType:IP4(means IPv4), Address:szIP
             "t=0 0\r\n"                     // Session active starttime endtime (from 1900/1/1 in seconds)
             "a=control:*\r\n"               // The control path of the stream can be any value
-            "m=video 0 RTP/AVP 96\r\n"      // MediaType:video, Port:0(response in SETUP), Protocal:RTP/AVP(RTP over UDP/Audio-Video Profile), RTPPayloadType:96(H.264)
-            "a=rtpmap:96 H264/90000\r\n"    // RTPPayloadType:96(H.264), Codec:H264, ClockFrequency:90000Hz
-            "a=control:track0\r\n",         // The control path of the stream is 'track0'
-            time( NULL ), szIP );
+#if SUPPORT_VIDEO
+            "m=video 0 RTP/AVP %d\r\n"      // MediaType:video, Port:0(response in SETUP), Protocal:RTP/AVP(RTP over UDP/Audio-Video Profile), RTPPayloadType:96(H.264)
+            "a=rtpmap:%d H264/90000\r\n"    // RTPPayloadType:96(H.264), Codec:H264, ClockFrequency:90000Hz
+            "a=control:track%d\r\n"         // The control path of the stream is 'track0'
+#endif
+            , time( NULL ), szIP
+#if SUPPORT_VIDEO
+            , RTP_PAYLOAD_TYPE_H264
+            , RTP_PAYLOAD_TYPE_H264
+            , RTSPInfo::TRACK_VIDEO
+#endif
+            );
 
+        strcat( szSDP, szSDP_Aud );
+
+        //
         snprintf( lpszBuf, iBufSize, 
             "RTSP/1.0 200 OK\r\n"
             "Cseq: %d\r\n"
@@ -329,13 +394,21 @@ bool RTSP::MakeResponse( int iBufSize, char* lpszBuf, RTSPInfo& dtRTSP )
     }
     else if( !strcmp( dtRTSP.m_szMethod, "SETUP" ) )
     {
+        // Get track index from URL
+        int iTrackIdx = dtRTSP.get_track_idx();
+        if( -1 == iTrackIdx )
+            return false;
+
         // Create UUID
-        char szUUID[ 37 ] = { 0 };
-        CreateUUID( szUUID );
-        dtRTSP.m_strSessionID = szUUID;
+        if( dtRTSP.m_strSessionID.empty() )
+        {
+            char szUUID[ 37 ] = { 0 };
+            CreateUUID( szUUID );
+            dtRTSP.m_strSessionID = szUUID;
+        }
 
         // Create SSRC
-        if( !this->CreateSSRC( dtRTSP.m_iSSRC ) )
+        if( !this->CreateSSRC( dtRTSP.m_arrSSRC[ iTrackIdx ] ) )
             return false;
 
         // Make SETUP response
@@ -345,7 +418,7 @@ bool RTSP::MakeResponse( int iBufSize, char* lpszBuf, RTSPInfo& dtRTSP )
             "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%d-%d;ssrc=%d;mode=play\r\n"
             "Session: %s; timeout=%d\r\n\r\n",
             dtRTSP.m_iCSeq, 
-            dtRTSP.m_iClientPort_RTP, dtRTSP.m_iClientPort_RTCP, PORT_RTP, PORT_RTCP, dtRTSP.m_iSSRC, 
+            dtRTSP.m_arrClientPort_RTP[ iTrackIdx ], dtRTSP.m_arrClientPort_RTCP[ iTrackIdx ], PORT_RTP, PORT_RTCP, dtRTSP.m_arrSSRC[ iTrackIdx ], 
             dtRTSP.m_strSessionID.c_str(), RTSP_TIMEOUT );
     }
     else if( !strcmp( dtRTSP.m_szMethod, "PLAY" ) )
@@ -375,121 +448,58 @@ bool RTSP::MakeResponse( int iBufSize, char* lpszBuf, RTSPInfo& dtRTSP )
     return true;
 }
 
-void RTSP::Play( ClientInfo& dtClient )
-{
-    // Set Dst addr info
+void RTSP::PlayVideo( ClientInfo& dtClient )
+{   // Note: Lock by caller
     char szIP[ 16 ] = { 0 };
     inet_ntop( AF_INET, &dtClient.m_sin.sin_addr, szIP, sizeof( szIP ) );
 
-    struct sockaddr_in sinDst = { 0 };
-    sinDst.sin_family      = AF_INET;
-    sinDst.sin_port        = htons( dtClient.m_dtRTSP.m_iClientPort_RTP );
-    sinDst.sin_addr.s_addr = inet_addr( szIP );
-
-    //
-    const auto tTimeStampStep = uint32_t( 90000 / FPS );    // Timestamp gap between two frames
-    const auto tSleepPeriod   = uint32_t( 1000 / FPS );     // Time gap between two frames
-
-    H264::FrameInfoEx dtFrm;
-    H264 oH264;
-    oH264.OpenFile( this->m_strFile.c_str(), CFileMap::modeRead );
-
-    RTPHeader dtRTPHeader( 0, 0, dtClient.m_dtRTSP.m_iSSRC );
-    RTPMan oRTPMan( dtRTPHeader );
-
-    while( dtClient.m_pThread.get() && !dtClient.m_pThread->is_exit() )
+    dtClient.m_pVidThread = make_shared< H264RTPSession >();
+    if( dtClient.m_pVidThread.get() )
     {
-        // Read Data
-        dtFrm = oH264.GetFrame();
+        char szFileName[ LEN_FILENAME ] = { 0 };
+        string strFullFilePath = "";
 
-        if( 0 == dtFrm.m_lFrmSize )
-        {
-            printf( "RTSP::Play - Finished\n" );
-            return;
-        }
-        else if( dtFrm.m_lFrmSize < 0 )
-        {
-            if( !oH264.is_opening() )
-                cerr << "RTSP::Play - File is not opened!" << endl;
-            else
-                cerr << "RTSP::Play - Get frame failed!" << endl;
+        dtClient.m_dtRTSP.get_file_name( szFileName );
 
-            return;
-        }
+        strFullFilePath  = this->GetFullFilePath( szFileName );
+        strFullFilePath += H264_FILE_EXT;
 
-        // Push Stream
-        this->PushStream( tTimeStampStep, oRTPMan, &dtFrm, (sockaddr*)&sinDst );
-
-        //
-        this_thread::sleep_for( chrono::milliseconds( tSleepPeriod ) );
+        dtClient.m_pVidThread->Start( 
+            this->m_fdRTP, 
+            dtClient.m_dtRTSP.m_arrSSRC[ RTSPInfo::TRACK_VIDEO ],
+            strFullFilePath, 
+            szIP, 
+            dtClient.m_dtRTSP.m_arrClientPort_RTP[ RTSPInfo::TRACK_VIDEO ] );
     }
 }
 
-bool RTSP::PushStream( const uint32_t nTimestampStep, RTPMan& oRTPMan, FrameInfo* lpFrmInfo, const sockaddr* lpClientSockAddr )
-{
-    uint8_t* pData     = NULL;
-    int64_t  lDataSize = 0;
-    int64_t  lPktCnt   = 0;
-    int64_t  lMaxData  = RTP_DATA_MAX_SIZE;
+void RTSP::PlayAudio( ClientInfo& dtClient )
+{   // Note: Lock by caller
+    char szIP[ 16 ] = { 0 };
+    inet_ntop( AF_INET, &dtClient.m_sin.sin_addr, szIP, sizeof( szIP ) );
 
-    switch( lpFrmInfo->m_eCodecType )
+    dtClient.m_pAudThread = make_shared< AACRTPSession >();
+    if( dtClient.m_pAudThread.get() )
     {
-    case CODEC_H264:
-        {
-            H264::FrameInfoEx* pFrmEx = dynamic_cast< H264::FrameInfoEx* >( lpFrmInfo );
-            if( pFrmEx )
-            {
-                pData     = pFrmEx->m_pBuf + pFrmEx->m_iStartCodeBytes;     // NALU data
-                lDataSize = pFrmEx->m_lFrmSize - pFrmEx->m_iStartCodeBytes; // NALU size
-                lPktCnt   = lDataSize / lMaxData;
-            }
-            else
-            {
-                cerr << "RTSP::PushStream - dynamic_cast H264::FrameInfoEx* failed!" << endl;
-                return false;
-            }
-        }
-        break;
+        char szFileName[ LEN_FILENAME ] = { 0 };
+        string strFullFilePath = "";
 
-    case CODEC_H265:
-        {
-            return false;   // Not Support
-        }
-        break;
+        dtClient.m_dtRTSP.get_file_name( szFileName );
 
-    default:
-        return false;
+        strFullFilePath  = this->GetFullFilePath( szFileName );
+        strFullFilePath += AAC_FILE_EXT;
+
+        dtClient.m_pAudThread->Start( 
+            this->m_fdRTP, 
+            dtClient.m_dtRTSP.m_arrSSRC[ RTSPInfo::TRACK_AUDIO ],
+            strFullFilePath, 
+            szIP, 
+            dtClient.m_dtRTSP.m_arrClientPort_RTP[ RTSPInfo::TRACK_AUDIO ] );
     }
-
-    //
-    int64_t lPos = 0;
-
-    if( lDataSize % lMaxData > 0 ) ++lPktCnt;  // Add a cycle for the recent data
-
-    for( int64_t i = 0, lPending = 0; i < lPktCnt; ++i )
-    {
-        //
-        lPending = oRTPMan.SetPayloadData( lpFrmInfo->m_eCodecType, pData, lPos, lDataSize, i );
-
-        //
-        if( 1 == lPktCnt )
-            lPending += RTP_HEADER_SIZE;
-        else
-            lPending += ( FU_SIZE + RTP_HEADER_SIZE );
-
-        oRTPMan.SendPacket( this->m_fdRTP, lPending, 0, lpClientSockAddr );
-
-        oRTPMan.Forward( nTimestampStep );
-
-        //
-        lPos += RTP_DATA_MAX_SIZE;
-    }
-
-    return true;
 }
 
 bool RTSP::ParseRequest( int iBufSize, const char* lpszBuf, ConnInfo* lpData )
-{
+{   // Note: Lock by caller
     if( !lpData )
     {
         fprintf( stderr, "RTSP::ParseRequest - Invalid data! ( lpData: 0x%p )\n", lpData );
@@ -526,6 +536,11 @@ bool RTSP::ParseRequest( int iBufSize, const char* lpszBuf, ConnInfo* lpData )
     // Parse method:SETUP
     if( !strcmp( lpClientInfo->m_dtRTSP.m_szMethod, "SETUP" ) )
     {
+        // Get track index from URL
+        int iTrackIdx = lpClientInfo->m_dtRTSP.get_track_idx();
+        if( -1 == iTrackIdx )
+            return false;
+            
         // Parse method:SETUP content
         int iBufLen = strlen( lpszBuf );
         while( iPos < iBufLen )
@@ -537,9 +552,10 @@ bool RTSP::ParseRequest( int iBufSize, const char* lpszBuf, ConnInfo* lpData )
             if( idx >= 0 )
             {
                 if( sscanf( szLine, "Transport: RTP/AVP;unicast;client_port=%d-%d\r\n", 
-                    &lpClientInfo->m_dtRTSP.m_iClientPort_RTP, &lpClientInfo->m_dtRTSP.m_iClientPort_RTCP ) != 2 )
+                    &lpClientInfo->m_dtRTSP.m_arrClientPort_RTP[ iTrackIdx ], &lpClientInfo->m_dtRTSP.m_arrClientPort_RTCP[ iTrackIdx ] ) != 2 )
                 {
                     cerr << "RTSP::ParseRequest - Parse RTSP SETUP content error!" << endl;
+                    cerr << szLine << endl;
                     return false;
                 }
 
@@ -552,7 +568,7 @@ bool RTSP::ParseRequest( int iBufSize, const char* lpszBuf, ConnInfo* lpData )
 }
 
 bool RTSP::SendResponse( ConnInfo* lpData )
-{
+{   // Note: Lock by caller
     if( !lpData )
     {
         fprintf( stderr, "RTSP::SendResponse - Invalid data! ( lpData: 0x%p )\n", lpData );
@@ -591,4 +607,17 @@ bool RTSP::Lock( int iTimeout )
 bool RTSP::Unlock()
 {
     return this->m_mtx.Unlock();
+}
+
+string RTSP::GetFullFilePath( const char* lpszFileName )
+{
+    string strFullFilePath = "";
+
+    strFullFilePath = this->m_strFilePath;
+    if( strFullFilePath.at( strFullFilePath.length() - 1 ) != '/' )
+        strFullFilePath += '/';
+    
+    strFullFilePath += lpszFileName;
+
+    return strFullFilePath;
 }

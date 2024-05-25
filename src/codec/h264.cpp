@@ -25,23 +25,28 @@ H264::FrameInfoEx H264::GetFrame( bool bNext/* = true*/ )
 
     // Is valid frame?
     uint8_t* pStartCode = NULL;
-    int iStartCodeBytes = FindStartCode( this->get_cur_pos(), &pStartCode );
+    int iStartCodeBytes = this->FindStartCode( this->get_cur_pos(), &pStartCode );
     if( 0 == iStartCodeBytes )
     {   // StartCode not found
         dtFrm.m_lFrmSize = -1;
         return dtFrm;
     }
 
+    // Get StartCode bytes
     dtFrm.m_iStartCodeBytes = iStartCodeBytes;
 
+    // Get frame buffer
+    if( this->get_cur_pos() != pStartCode )
+        this->Seek( pStartCode - this->get_cur_pos(), CFileMap::SeekPosition::current );
+
+    dtFrm.m_pBuf = this->get_cur_pos();
+
     // Find next frame start position, and get current frame info
-    iStartCodeBytes = FindStartCode( this->get_cur_pos() + iStartCodeBytes, &pStartCode );
+    iStartCodeBytes = this->FindStartCode( this->get_cur_pos() + iStartCodeBytes, &pStartCode );
     if( 0 == iStartCodeBytes ) // Next startcode not found, is last frame
         dtFrm.m_lFrmSize = this->get_end_pos() - this->get_cur_pos();
     else
         dtFrm.m_lFrmSize = pStartCode - this->get_cur_pos();
-
-    dtFrm.m_pBuf = this->get_cur_pos();
 
     // Seek to next frame
     if( bNext ) this->Seek( dtFrm.m_lFrmSize, CFileMap::SeekPosition::current );

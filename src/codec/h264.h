@@ -3,12 +3,16 @@
 #include "../common/filemap.h"
 #include "codec.h"
 
-#define NALU_FNRI_MASK          0xE0
-#define NALU_TYPE_MASK          0x1F
+#define H264_FILE_EXT   ".h264"
 
-#define FU_FUA_MASK             0x1C    // 28: Use FU-A Fragmentation 
-#define FU_S_MASK               0x80
-#define FU_E_MASK               0x40
+#define FPS             30
+
+#define NALU_FNRI_MASK  0xE0
+#define NALU_TYPE_MASK  0x1F
+
+#define FU_FUA_MASK     0x1C    // 28: Use FU-A Fragmentation 
+#define FU_S_MASK       0x80
+#define FU_E_MASK       0x40
 
 class H264 : public CFileMap
 {
@@ -26,6 +30,9 @@ public:
         }
 
         virtual ~FrameInfoEx() {}
+
+        inline uint8_t* get_nalu_data() { return ( this->m_pBuf + this->m_iStartCodeBytes ); }
+        inline int64_t  get_nalu_size() { return ( this->m_lFrmSize - this->m_iStartCodeBytes );}
     };
 
 // Methods

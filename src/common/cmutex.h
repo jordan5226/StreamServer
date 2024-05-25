@@ -1,7 +1,6 @@
 #pragma once
 
 #include <mutex>
-#include <thread>
 
 #define INFINITY    0xffffffff
 
